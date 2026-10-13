@@ -1,4 +1,3 @@
-
 # main.py
 import argparse
 import asyncio
@@ -28,10 +27,8 @@ async def run_single(mode: str = "paper", entry_remain: int = None):
     else:
         executor = LiveExecutor(strategy, tag=f"T-{entry_remain}")
 
-    # 1. 将 WebSocket 启动作为后台任务，不要卡住主线程
     feed_task = asyncio.create_task(feed.start())
     
-    # 2. 等待市场发现（加超时和日志）
     wait_sec = 0
     while not feed.token_ids and wait_sec < 30:
         await asyncio.sleep(0.5)
@@ -54,7 +51,6 @@ async def run_single(mode: str = "paper", entry_remain: int = None):
                 if signal:
                     if executor.execute(signal):
                         logger.info(f"入场 {signal.direction} @{signal.entry_ask:.3f} slug={signal.market_slug}")
-            # 极速循环，100ms 检查一次，大幅降低延迟
             await asyncio.sleep(0.1)
     finally:
         feed.stop()
@@ -140,4 +136,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
