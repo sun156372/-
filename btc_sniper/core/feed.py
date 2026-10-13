@@ -274,4 +274,3 @@ class Feed:
             "up_open_price": self.up_open_price, "down_open_price": self.down_open_price,
             "spot_price": self.spot_price, "spot_open": self.spot_open, "spot_updated_at": time.time(),
         }
-EOF
