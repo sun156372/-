@@ -1,4 +1,3 @@
-
 # core/feed.py
 import asyncio
 import json
@@ -18,8 +17,8 @@ class Level:
 class Book:
     def __init__(self, token_id: str):
         self.token_id = token_id
-        self.bids: List[Level] = []
-        self.asks: List[Level] = []
+        self.bids: List[Level] = []   # 降序
+        self.asks: List[Level] = []   # 升序
         self.updated_at = 0.0
 
     @property
@@ -179,15 +178,28 @@ class Feed:
                     await ws.send(json.dumps(sub))
                     print(f"[{time.strftime('%H:%M:%S')}] WebSocket 已订阅: {self.token_ids}")
                     async for raw in ws:
-                        msg = json.loads(raw)
-                        self._handle_ws_message(msg)
+                        try:
+                            msg = json.loads(raw)
+                            self._handle_ws_message(msg)
+                        except json.JSONDecodeError:
+                            pass
             except Exception as e:
                 print(f"[{time.strftime('%H:%M:%S')}] WebSocket 断开或异常: {repr(e)}")
                 if not self._running: break
                 await asyncio.sleep(CFG.WS_RECONNECT_BASE)
 
-    def _handle_ws_message(self, msg: Dict[str, Any]):
+    def _handle_ws_message(self, msg):
+        # === 关键修复：判断如果推送是列表，则遍历递归处理 ===
+        if isinstance(msg, list):
+            for item in msg:
+                self._handle_ws_message(item)
+            return
+        # === 关键修复：如果既不是字典也不是列表，直接返回 ===
+        if not isinstance(msg, dict):
+            return
+
         event_type = msg.get("event_type", "")
+        
         if event_type == "book":
             token_id = msg.get("asset_id")
             if token_id in self.books:
@@ -195,28 +207,36 @@ class Feed:
                 book.bids = self._parse_levels(msg.get("bids", []), reverse=True)
                 book.asks = self._parse_levels(msg.get("asks", []), reverse=False)
                 book.updated_at = time.time()
+
         elif event_type == "price_change":
             for ch in msg.get("price_changes", []):
                 tid = ch.get("asset_id")
-                if tid not in self.books: continue
+                if tid not in self.books:
+                    continue
                 book = self.books[tid]
                 side = str(ch.get("side", "")).upper()
                 price = float(ch.get("price", 0))
                 size = float(ch.get("size", 0))
+
                 target = book.bids if side == "BUY" else book.asks
                 target[:] = [lv for lv in target if abs(lv.price - price) > 1e-9]
-                if size > 1e-9: target.append(Level(price=price, size=size))
+                if size > 1e-9:
+                    target.append(Level(price=price, size=size))
                 reverse = side == "BUY"
                 target.sort(key=lambda z: z.price, reverse=reverse)
                 book.updated_at = time.time()
+
         elif event_type == "best_bid_ask":
             tid = msg.get("asset_id")
-            if tid not in self.books: return
+            if tid not in self.books:
+                return
             book = self.books[tid]
             bid = msg.get("best_bid")
             ask = msg.get("best_ask")
-            if bid: book.bids = [Level(price=float(bid), size=0.0)]
-            if ask: book.asks = [Level(price=float(ask), size=0.0)]
+            if bid:
+                book.bids = [Level(price=float(bid), size=0.0)]
+            if ask:
+                book.asks = [Level(price=float(ask), size=0.0)]
             book.updated_at = time.time()
 
     async def start(self):
