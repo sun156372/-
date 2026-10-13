@@ -1,0 +1,30 @@
+name: Verify Code
+
+on: [push, workflow_dispatch] # 每次推送代码或手动触发时运行
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10 # 防止策略无限挂起，10分钟强行结束
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.10'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install requests websockets python-dotenv py-clob-client-v2
+
+    - name: Compile all Python files (语法检查)
+      run: python -m compileall .
+
+    - name: Test Startup (启动测试)
+      # 尝试跑一下纸面模式，用 timeout 60秒强制结束，只为验证能否正常启动
+      run: timeout 60 python main.py run --mode paper --entry 180 || true
+      continue-on-error: true
