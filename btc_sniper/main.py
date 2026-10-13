@@ -1,5 +1,4 @@
-cd /root/-/btc_sniper
-cat > main.py << 'EOF'
+
 # main.py
 import argparse
 import asyncio
