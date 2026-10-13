@@ -1,4 +1,4 @@
-cat > core/feed.py << 'EOF'
+
 # core/feed.py
 import asyncio
 import json
