@@ -3,7 +3,9 @@ import argparse
 import asyncio
 import logging
 import time
+import json
 import sys
+from pathlib import Path
 
 from config.config import CFG
 from core.feed import Feed
@@ -11,50 +13,39 @@ from core.strategy import Strategy
 from core.executor import PaperExecutor, LiveExecutor
 from modules.analytics.report import ReportGenerator
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("Main")
+
+def dump_rejects(runners):
+    data_dir = Path(CFG.DATA_DIR)
+    data_dir.mkdir(parents=True, exist_ok=True)
+    for r in runners:
+        if r["strategy"].reject_stats:
+            path = data_dir / f"rejects_{r['label']}.json"
+            path.write_text(json.dumps(r["strategy"].reject_stats, ensure_ascii=False, indent=2), encoding="utf-8")
 
 async def run_single(mode: str = "paper", entry_remain: int = None):
     entry_remain = entry_remain or CFG.DEFAULT_ENTRY_REMAIN
     logger.info(f"启动单点实时循环 mode={mode} entry=T-{entry_remain}")
-
     feed = Feed()
     strategy = Strategy(entry_remain=entry_remain, state_suffix=f"T-{entry_remain}")
-    if mode == "paper":
-        executor = PaperExecutor(strategy, tag=f"T-{entry_remain}")
-    else:
-        executor = LiveExecutor(strategy, tag=f"T-{entry_remain}")
-
+    executor = PaperExecutor(strategy, tag=f"T-{entry_remain}") if mode == "paper" else LiveExecutor(strategy, tag=f"T-{entry_remain}")
     feed_task = asyncio.create_task(feed.start())
     
     wait_sec = 0
     while not feed.token_ids and wait_sec < 30:
-        await asyncio.sleep(0.5)
-        wait_sec += 0.5
-        if int(wait_sec) % 5 == 0:
-            logger.info(f"等待市场发现... {wait_sec}秒")
-
+        await asyncio.sleep(0.5); wait_sec += 0.5
     if not feed.token_ids:
-        logger.error("市场发现超时，请检查网络或 Gamma API。")
-        feed.stop()
-        return
+        logger.error("市场发现超时"); feed.stop(); return
 
-    logger.info("市场发现成功，开始极速策略循环（100ms 响应一次）...")
-    
-    # 核心修复：加入市场轮转检查
+    logger.info("市场发现成功，开始极速策略循环...")
     last_market_check = 0
-    
+    last_dump = 0
     try:
         while True:
             now_ts = int(time.time())
-            # 每 5 秒检查一次是否要轮转到下一个 5m 窗口
             if now_ts - last_market_check > 5:
-                feed.discover_market()
-                last_market_check = now_ts
-                
+                feed.discover_market(); last_market_check = now_ts
             tick = feed.get_tick()
             if tick:
                 executor.on_tick(tick)
@@ -62,73 +53,57 @@ async def run_single(mode: str = "paper", entry_remain: int = None):
                 if signal:
                     if executor.execute(signal):
                         logger.info(f"入场 {signal.direction} @{signal.entry_ask:.3f} slug={signal.market_slug}")
+            
+            if now_ts - last_dump > 10:  # 每10秒落盘一次统计
+                dump_rejects([{"label": f"T-{entry_remain}", "strategy": strategy}])
+                last_dump = now_ts
             await asyncio.sleep(0.1)
     finally:
         feed.stop()
         feed_task.cancel()
-        try:
-            await feed_task
-        except asyncio.CancelledError:
-            pass
 
 async def run_sweep(mode: str = "paper"):
     logger.info(f"启动多时间点扫描 mode={mode}")
-    entry_times = list(CFG.ENTRY_TIMES)
     runners = []
-    for cfg in entry_times:
-        label = cfg["label"]
-        remain = cfg["remain"]
+    for cfg in CFG.ENTRY_TIMES:
+        label = cfg["label"]; remain = cfg["remain"]
         strat = Strategy(entry_remain=remain, state_suffix=label)
-        if mode == "paper":
-            exec_ = PaperExecutor(strat, tag=label)
-        else:
-            exec_ = LiveExecutor(strat, tag=label)
+        exec_ = PaperExecutor(strat, tag=label) if mode == "paper" else LiveExecutor(strat, tag=label)
         runners.append({"label": label, "strategy": strat, "executor": exec_})
         logger.info(f"[Sweep] 初始化 {label} (remain={remain}s)")
 
     feed = Feed()
     feed_task = asyncio.create_task(feed.start())
-    
     wait_sec = 0
     while not feed.token_ids and wait_sec < 30:
-        await asyncio.sleep(0.5)
-        wait_sec += 0.5
-        if int(wait_sec) % 5 == 0:
-            logger.info(f"等待市场发现... {wait_sec}秒")
-
+        await asyncio.sleep(0.5); wait_sec += 0.5
     if not feed.token_ids:
-        logger.error("市场发现超时")
-        feed.stop()
-        return
+        logger.error("市场发现超时"); feed.stop(); return
 
     logger.info("扫描模式启动成功，开始极速策略循环...")
-    
     last_market_check = 0
-    
+    last_dump = 0
     try:
         while True:
             now_ts = int(time.time())
             if now_ts - last_market_check > 5:
-                feed.discover_market()
-                last_market_check = now_ts
-                
+                feed.discover_market(); last_market_check = now_ts
             tick = feed.get_tick()
             if tick:
                 for r in runners:
                     r["executor"].on_tick(tick)
                     signal = r["strategy"].evaluate(tick)
                     if signal:
-                        ok = r["executor"].execute(signal)
-                        if ok:
+                        if r["executor"].execute(signal):
                             logger.info(f"[{r['label']}] 入场 {signal.direction} @{signal.entry_ask:.3f}")
+            
+            if now_ts - last_dump > 10:
+                dump_rejects(runners)
+                last_dump = now_ts
             await asyncio.sleep(0.1)
     finally:
         feed.stop()
         feed_task.cancel()
-        try:
-            await feed_task
-        except asyncio.CancelledError:
-            pass
 
 def main():
     parser = argparse.ArgumentParser(description="Polymarket BTC 5m Sniper")
@@ -150,8 +125,11 @@ def main():
         elif args.command == "report":
             gen = ReportGenerator()
             gen.print_compare(args.tags or ["T-240", "T-210", "T-180", "T-150", "T-120"])
+            gen.print_rejections(args.tags or ["T-240", "T-210", "T-180", "T-150", "T-120"]) # 增加拒绝打印
     except KeyboardInterrupt:
         logger.info("已停止")
+        # 退出前保存一次
+        pass
 
 if __name__ == "__main__":
     main()
