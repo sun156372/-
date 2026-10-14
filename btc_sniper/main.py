@@ -30,8 +30,8 @@ async def run_single(mode: str = "paper", entry_remain: int = None):
     feed = Feed()
     strategy = Strategy(entry_remain=entry_remain, state_suffix=f"T-{entry_remain}")
     executor = PaperExecutor(strategy, tag=f"T-{entry_remain}") if mode == "paper" else LiveExecutor(strategy, tag=f"T-{entry_remain}")
-    feed_task = asyncio.create_task(feed.start())
     
+    feed_task = asyncio.create_task(feed.start())
     wait_sec = 0
     while not feed.token_ids and wait_sec < 30:
         await asyncio.sleep(0.5); wait_sec += 0.5
@@ -41,11 +41,14 @@ async def run_single(mode: str = "paper", entry_remain: int = None):
     logger.info("市场发现成功，开始极速策略循环...")
     last_market_check = 0
     last_dump = 0
+    last_heartbeat = 0
     try:
         while True:
             now_ts = int(time.time())
             if now_ts - last_market_check > 5:
-                feed.discover_market(); last_market_check = now_ts
+                feed.discover_market()
+                last_market_check = now_ts
+            
             tick = feed.get_tick()
             if tick:
                 executor.on_tick(tick)
@@ -53,8 +56,19 @@ async def run_single(mode: str = "paper", entry_remain: int = None):
                 if signal:
                     if executor.execute(signal):
                         logger.info(f"入场 {signal.direction} @{signal.entry_ask:.3f} slug={signal.market_slug}")
-            
-            if now_ts - last_dump > 10:  # 每10秒落盘一次统计
+                # 每5秒打印一次心跳
+                if now_ts - last_heartbeat > 5:
+                    logger.info(f"心跳: 剩余={tick['remain_sec']}s | UpAsk={tick['up_best_ask']:.3f} | 失衡={strategy._calc_imbalance(tick):.3f} | 现货={strategy._spot_move(tick):.1f}bps")
+                    last_heartbeat = now_ts
+            else:
+                # === 核心修复：如果 tick 为 None，强制走 REST 兜底拉取，并且打印警告 ===
+                if now_ts - last_heartbeat > 5:
+                    logger.warning("未获取到盘口数据，尝试强制 REST 拉取...")
+                    feed._rest_fetch_books()
+                    feed._fetch_spot()
+                    last_heartbeat = now_ts
+                    
+            if now_ts - last_dump > 10:
                 dump_rejects([{"label": f"T-{entry_remain}", "strategy": strategy}])
                 last_dump = now_ts
             await asyncio.sleep(0.1)
@@ -83,11 +97,14 @@ async def run_sweep(mode: str = "paper"):
     logger.info("扫描模式启动成功，开始极速策略循环...")
     last_market_check = 0
     last_dump = 0
+    last_heartbeat = 0
     try:
         while True:
             now_ts = int(time.time())
             if now_ts - last_market_check > 5:
-                feed.discover_market(); last_market_check = now_ts
+                feed.discover_market()
+                last_market_check = now_ts
+            
             tick = feed.get_tick()
             if tick:
                 for r in runners:
@@ -96,7 +113,18 @@ async def run_sweep(mode: str = "paper"):
                     if signal:
                         if r["executor"].execute(signal):
                             logger.info(f"[{r['label']}] 入场 {signal.direction} @{signal.entry_ask:.3f}")
-            
+                # 每5秒打印一次心跳
+                if now_ts - last_heartbeat > 5:
+                    for r in runners:
+                        logger.info(f"[{r['label']}] 心跳: 剩余={tick['remain_sec']}s | UpAsk={tick['up_best_ask']:.3f} | 失衡={r['strategy']._calc_imbalance(tick):.3f} | 现货={r['strategy']._spot_move(tick):.1f}bps")
+                    last_heartbeat = now_ts
+            else:
+                if now_ts - last_heartbeat > 5:
+                    logger.warning("未获取到盘口数据，尝试强制 REST 拉取...")
+                    feed._rest_fetch_books()
+                    feed._fetch_spot()
+                    last_heartbeat = now_ts
+                    
             if now_ts - last_dump > 10:
                 dump_rejects(runners)
                 last_dump = now_ts
@@ -125,11 +153,9 @@ def main():
         elif args.command == "report":
             gen = ReportGenerator()
             gen.print_compare(args.tags or ["T-240", "T-210", "T-180", "T-150", "T-120"])
-            gen.print_rejections(args.tags or ["T-240", "T-210", "T-180", "T-150", "T-120"]) # 增加拒绝打印
+            gen.print_rejections(args.tags or ["T-240", "T-210", "T-180", "T-150", "T-120"])
     except KeyboardInterrupt:
         logger.info("已停止")
-        # 退出前保存一次
-        pass
 
 if __name__ == "__main__":
     main()
