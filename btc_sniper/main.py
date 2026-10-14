@@ -56,15 +56,14 @@ async def run_single(mode: str = "paper", entry_remain: int = None):
                 if signal:
                     if executor.execute(signal):
                         logger.info(f"入场 {signal.direction} @{signal.entry_ask:.3f} slug={signal.market_slug}")
-                # 每5秒打印一次心跳
                 if now_ts - last_heartbeat > 5:
                     logger.info(f"心跳: 剩余={tick['remain_sec']}s | UpAsk={tick['up_best_ask']:.3f} | 失衡={strategy._calc_imbalance(tick):.3f} | 现货={strategy._spot_move(tick):.1f}bps")
                     last_heartbeat = now_ts
             else:
-                # === 核心修复：如果 tick 为 None，强制走 REST 兜底拉取，并且打印警告 ===
                 if now_ts - last_heartbeat > 5:
-                    logger.warning("未获取到盘口数据，尝试强制 REST 拉取...")
-                    feed._rest_fetch_books()
+                    logger.warning("未获取到 tick 数据，检查 feed.books 状态...")
+                    logger.info(f"当前 books 数量: {len(feed.books)}, token_ids: {feed.token_ids}")
+                    feed._rest_fetch_books() # 强制 REST 拉取
                     feed._fetch_spot()
                     last_heartbeat = now_ts
                     
@@ -113,14 +112,14 @@ async def run_sweep(mode: str = "paper"):
                     if signal:
                         if r["executor"].execute(signal):
                             logger.info(f"[{r['label']}] 入场 {signal.direction} @{signal.entry_ask:.3f}")
-                # 每5秒打印一次心跳
                 if now_ts - last_heartbeat > 5:
                     for r in runners:
                         logger.info(f"[{r['label']}] 心跳: 剩余={tick['remain_sec']}s | UpAsk={tick['up_best_ask']:.3f} | 失衡={r['strategy']._calc_imbalance(tick):.3f} | 现货={r['strategy']._spot_move(tick):.1f}bps")
                     last_heartbeat = now_ts
             else:
                 if now_ts - last_heartbeat > 5:
-                    logger.warning("未获取到盘口数据，尝试强制 REST 拉取...")
+                    logger.warning("未获取到 tick 数据，检查 feed.books 状态...")
+                    logger.info(f"当前 books 数量: {len(feed.books)}, token_ids: {feed.token_ids}")
                     feed._rest_fetch_books()
                     feed._fetch_spot()
                     last_heartbeat = now_ts
