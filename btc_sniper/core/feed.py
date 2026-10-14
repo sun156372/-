@@ -2,11 +2,16 @@
 import asyncio
 import json
 import time
+import socket
 import requests
 import websockets
+import requests.packages.urllib3.util.connection as urllib3_cn
 from typing import Optional, List, Dict, Any, Tuple
 
 from config.config import CFG
+
+# 强制使用 IPv4，防止阿姆斯特丹服务器被 Cloudflare 的 IPv6 静默阻断
+urllib3_cn.allowed_gai_family = lambda: socket.AF_INET
 
 class Level:
     __slots__ = ("price", "size")
@@ -17,8 +22,8 @@ class Level:
 class Book:
     def __init__(self, token_id: str):
         self.token_id = token_id
-        self.bids: List[Level] = []   # 降序
-        self.asks: List[Level] = []   # 升序
+        self.bids: List[Level] = []
+        self.asks: List[Level] = []
         self.updated_at = 0.0
 
     @property
@@ -58,6 +63,9 @@ class Feed:
         self._running = False
         self._session = requests.Session()
         self._session.headers["User-Agent"] = "polymarket-sniper/1.0"
+        
+        # 新增：记录上一次市场检查时间
+        self.last_market_check = 0
 
     def _http_get(self, url: str, params: dict = None, timeout: int = 10) -> Any:
         for i in range(CFG.HTTP_RETRIES):
@@ -66,13 +74,21 @@ class Feed:
                 r.raise_for_status()
                 return r.json()
             except Exception as e:
-                if i == CFG.HTTP_RETRIES - 1: raise RuntimeError(f"GET failed {url}: {e}")
+                if i == CFG.HTTP_RETRIES - 1:
+                    print(f"[HTTP错误] {url}: {e}")
+                    raise RuntimeError(f"GET failed {url}: {e}")
                 time.sleep(CFG.HTTP_RETRY_SLEEP * (i + 1))
 
     def discover_market(self) -> bool:
         now = int(time.time())
         window_secs = CFG.WINDOW_SECONDS
         base = (now // window_secs) * window_secs
+        
+        # 引入轮转检查，防止频繁请求
+        if now - self.last_market_check < 5 and self.market_slug:
+            return True
+        self.last_market_check = now
+
         for offset in CFG.MARKET_SEARCH_OFFSETS:
             start = base + offset
             end = start + window_secs
@@ -88,16 +104,31 @@ class Feed:
                 market = markets[0]
                 up_id, down_id = self._parse_ids(market)
                 if not up_id or not down_id: continue
+                
+                # 如果发现了新窗口，重置状态并记录开盘价
                 if self.market_slug != slug:
                     self.market_slug = slug
                     self.market_end_ts = end
                     self.token_ids = [up_id, down_id]
-                    self.up_open_price = 0.0
-                    self.down_open_price = 0.0
-                    self.spot_open = 0.0
-                    self._fetch_spot()
-                    self._rest_fetch_books()
-                    self._set_open_prices()
+                    
+                    now_ts = int(time.time())
+                    elapsed = now_ts - start
+                    # 修复：开盘价记录太晚的问题
+                    if elapsed <= 15:
+                        self.up_open_price = 0.0
+                        self.down_open_price = 0.0
+                        self.spot_open = 0.0
+                        self._fetch_spot()
+                        self._rest_fetch_books()
+                        self._set_open_prices()
+                        print(f"[{time.strftime('%H:%M:%S')}] 新窗口: {slug}，开盘价记录成功 (elapsed={elapsed}s)")
+                    else:
+                        # 迟到太久，即使记录了也会因为差值被压缩而过度拒绝，给出警告
+                        print(f"[{time.strftime('%H:%M:%S')}] ⚠️ 开盘价记录迟到 {elapsed}秒！差值将被压缩。")
+                        self._fetch_spot()
+                        self._rest_fetch_books()
+                        self._set_open_prices()
+                    
                     for tid in self.token_ids:
                         if tid not in self.books: self.books[tid] = Book(token_id=tid)
                 return True
@@ -189,12 +220,11 @@ class Feed:
                 await asyncio.sleep(CFG.WS_RECONNECT_BASE)
 
     def _handle_ws_message(self, msg):
-        # === 关键修复：判断如果推送是列表，则遍历递归处理 ===
+        # 关键修复：判断如果推送是列表，则遍历递归处理
         if isinstance(msg, list):
             for item in msg:
                 self._handle_ws_message(item)
             return
-        # === 关键修复：如果既不是字典也不是列表，直接返回 ===
         if not isinstance(msg, dict):
             return
 
@@ -211,8 +241,7 @@ class Feed:
         elif event_type == "price_change":
             for ch in msg.get("price_changes", []):
                 tid = ch.get("asset_id")
-                if tid not in self.books:
-                    continue
+                if tid not in self.books: continue
                 book = self.books[tid]
                 side = str(ch.get("side", "")).upper()
                 price = float(ch.get("price", 0))
@@ -228,15 +257,12 @@ class Feed:
 
         elif event_type == "best_bid_ask":
             tid = msg.get("asset_id")
-            if tid not in self.books:
-                return
+            if tid not in self.books: return
             book = self.books[tid]
             bid = msg.get("best_bid")
             ask = msg.get("best_ask")
-            if bid:
-                book.bids = [Level(price=float(bid), size=0.0)]
-            if ask:
-                book.asks = [Level(price=float(ask), size=0.0)]
+            if bid: book.bids = [Level(price=float(bid), size=0.0)]
+            if ask: book.asks = [Level(price=float(ask), size=0.0)]
             book.updated_at = time.time()
 
     async def start(self):
