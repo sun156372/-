@@ -28,17 +28,18 @@ class Book:
 
     @property
     def best_ask(self) -> Optional[float]:
-        return self.asks[0].price if self.asks else None
+        # 极致兜底：如果没有卖单，表示卖盘枯竭（价格逼近 1.0）
+        return self.asks[0].price if self.asks else 0.99
     @property
     def best_bid(self) -> Optional[float]:
-        return self.bids[0].price if self.bids else None
+        # 极致兜底：如果没有买单，表示买盘枯竭（价格逼近 0.01）
+        return self.bids[0].price if self.bids else 0.01
     @property
     def spread(self) -> Optional[float]:
-        if self.best_bid is None or self.best_ask is None: return None
         return self.best_ask - self.best_bid
     @property
     def ask_depth(self) -> float:
-        return sum(lv.size for lv in self.asks[:5])
+        return sum(lv.size for lv in self.asks[:5]) if self.asks else 0.0
     @property
     def bid_notional(self) -> float:
         return sum(lv.price * lv.size for lv in self.bids)
@@ -62,12 +63,8 @@ class Feed:
         self._ws = None
         self._running = False
         self._session = requests.Session()
-        # 伪装浏览器，降低被 CF 拦截的概率
-        self._session.headers.update({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        })
+        self._session.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
         self.last_market_check = 0
-        self._ws_msg_count = 0
 
     def _http_get(self, url: str, params: dict = None, timeout: int = 10) -> Any:
         for i in range(CFG.HTTP_RETRIES):
@@ -76,7 +73,6 @@ class Feed:
                 r.raise_for_status()
                 return r.json()
             except Exception as e:
-                print(f"[HTTP错误] {url}: {e}")
                 if i == CFG.HTTP_RETRIES - 1:
                     raise RuntimeError(f"GET failed {url}: {e}")
                 time.sleep(CFG.HTTP_RETRY_SLEEP * (i + 1))
@@ -85,9 +81,7 @@ class Feed:
         now = int(time.time())
         window_secs = CFG.WINDOW_SECONDS
         base = (now // window_secs) * window_secs
-        
-        if now - self.last_market_check < 5 and self.market_slug:
-            return True
+        if now - self.last_market_check < 5 and self.market_slug: return True
         self.last_market_check = now
 
         for offset in CFG.MARKET_SEARCH_OFFSETS:
@@ -110,21 +104,16 @@ class Feed:
                     self.market_slug = slug
                     self.market_end_ts = end
                     self.token_ids = [up_id, down_id]
-                    
                     now_ts = int(time.time())
                     elapsed = now_ts - start
                     print(f"[{time.strftime('%H:%M:%S')}] 发现新窗口: {slug} (elapsed={elapsed}s)")
-                    
                     self._fetch_spot()
-                    self._rest_fetch_books()  # 强制 REST 拉取一次快照
+                    self._rest_fetch_books()
                     self._set_open_prices()
-                    
                     for tid in self.token_ids:
                         if tid not in self.books: self.books[tid] = Book(token_id=tid)
                 return True
-            except Exception as e:
-                print(f"[{time.strftime('%H:%M:%S')}] 市场发现异常: {e}")
-                continue
+            except Exception: continue
         return False
 
     def _set_open_prices(self):
@@ -159,8 +148,7 @@ class Feed:
         try:
             data = self._http_get("https://api.binance.com/api/v3/ticker/price", params={"symbol": "BTCUSDT"}, timeout=3)
             self.spot_price = float(data["price"])
-        except Exception as e:
-            print(f"[{time.strftime('%H:%M:%S')}] 现货获取失败: {e}")
+        except Exception: pass
 
     def _rest_fetch_books(self):
         if len(self.token_ids) < 2: return
@@ -195,11 +183,7 @@ class Feed:
         while self._running:
             try:
                 print(f"[{time.strftime('%H:%M:%S')}] 尝试连接 WebSocket...")
-                async with websockets.connect(
-                    self.ws_url,
-                    ping_interval=CFG.WS_PING_INTERVAL,
-                    ping_timeout=CFG.WS_PING_TIMEOUT,
-                ) as ws:
+                async with websockets.connect(self.ws_url, ping_interval=CFG.WS_PING_INTERVAL, ping_timeout=CFG.WS_PING_TIMEOUT) as ws:
                     self._ws = ws
                     sub = {"assets_ids": self.token_ids, "type": "market", "custom_feature_enabled": True}
                     await ws.send(json.dumps(sub))
@@ -208,8 +192,7 @@ class Feed:
                         try:
                             msg = json.loads(raw)
                             self._handle_ws_message(msg)
-                        except json.JSONDecodeError:
-                            pass
+                        except json.JSONDecodeError: pass
             except Exception as e:
                 print(f"[{time.strftime('%H:%M:%S')}] WebSocket 断开或异常: {repr(e)}")
                 if not self._running: break
@@ -217,18 +200,11 @@ class Feed:
 
     def _handle_ws_message(self, msg):
         if isinstance(msg, list):
-            for item in msg:
-                self._handle_ws_message(item)
+            for item in msg: self._handle_ws_message(item)
             return
         if not isinstance(msg, dict): return
 
         event_type = msg.get("event_type", "")
-        
-        # 为了调试，把收到的所有事件类型都打印出来（只打印前10条，防止刷屏）
-        self._ws_msg_count += 1
-        if self._ws_msg_count <= 10:
-            print(f"[WS 消息] 类型={event_type} 内容={str(msg)[:200]}...")
-
         if event_type == "book":
             token_id = msg.get("asset_id")
             if token_id in self.books:
@@ -236,8 +212,6 @@ class Feed:
                 book.bids = self._parse_levels(msg.get("bids", []), reverse=True)
                 book.asks = self._parse_levels(msg.get("asks", []), reverse=False)
                 book.updated_at = time.time()
-                print(f"[{time.strftime('%H:%M:%S')}] WS 更新盘口: 买一={book.best_bid} 卖一={book.best_ask}")
-
         elif event_type == "price_change":
             for ch in msg.get("price_changes", []):
                 tid = ch.get("asset_id")
@@ -246,21 +220,16 @@ class Feed:
                 side = str(ch.get("side", "")).upper()
                 price = float(ch.get("price", 0))
                 size = float(ch.get("size", 0))
-
                 target = book.bids if side == "BUY" else book.asks
                 target[:] = [lv for lv in target if abs(lv.price - price) > 1e-9]
-                if size > 1e-9:
-                    target.append(Level(price=price, size=size))
-                reverse = side == "BUY"
-                target.sort(key=lambda z: z.price, reverse=reverse)
+                if size > 1e-9: target.append(Level(price=price, size=size))
+                target.sort(key=lambda z: z.price, reverse=(side == "BUY"))
                 book.updated_at = time.time()
-
         elif event_type == "best_bid_ask":
             tid = msg.get("asset_id")
             if tid not in self.books: return
             book = self.books[tid]
-            bid = msg.get("best_bid")
-            ask = msg.get("best_ask")
+            bid, ask = msg.get("best_bid"), msg.get("best_ask")
             if bid: book.bids = [Level(price=float(bid), size=0.0)]
             if ask: book.asks = [Level(price=float(ask), size=0.0)]
             book.updated_at = time.time()
@@ -271,16 +240,9 @@ class Feed:
             if self.discover_market(): break
             await asyncio.sleep(2)
         if not self.token_ids: raise RuntimeError("无法发现 BTC 5m 市场")
-        
-        # 等待首批 REST 数据
         self._fetch_spot()
         self._rest_fetch_books()
-        
-        await asyncio.gather(
-            self._ws_loop(),
-            self._rest_fallback_loop(),
-            self._spot_loop(),
-        )
+        await asyncio.gather(self._ws_loop(), self._rest_fallback_loop(), self._spot_loop())
 
     async def _rest_fallback_loop(self):
         while self._running:
@@ -289,16 +251,14 @@ class Feed:
             now = time.time()
             for book in self.books.values():
                 if now - book.updated_at > CFG.BOOK_STALE_SEC:
-                    self._rest_fetch_books()
-                    break
+                    self._rest_fetch_books(); break
 
     async def _spot_loop(self):
         while self._running:
             self._fetch_spot()
             await asyncio.sleep(1.0)
 
-    def stop(self):
-        self._running = False
+    def stop(self): self._running = False
 
     def get_tick(self) -> Optional[Dict[str, Any]]:
         if len(self.token_ids) < 2: return None
@@ -306,10 +266,8 @@ class Feed:
         up_book = self.books.get(up_id)
         down_book = self.books.get(down_id)
         
-        if not up_book or not down_book: 
-            return None
-        if up_book.best_ask is None or down_book.best_ask is None: 
-            return None
+        # 核心修复：只要有 book 对象就返回，不再强制要求买卖一存在
+        if not up_book or not down_book: return None
             
         now = int(time.time())
         return {
