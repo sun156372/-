@@ -2,6 +2,7 @@
 import argparse
 import asyncio
 import logging
+import time
 import sys
 
 from config.config import CFG
@@ -42,8 +43,18 @@ async def run_single(mode: str = "paper", entry_remain: int = None):
         return
 
     logger.info("市场发现成功，开始极速策略循环（100ms 响应一次）...")
+    
+    # 核心修复：加入市场轮转检查
+    last_market_check = 0
+    
     try:
         while True:
+            now_ts = int(time.time())
+            # 每 5 秒检查一次是否要轮转到下一个 5m 窗口
+            if now_ts - last_market_check > 5:
+                feed.discover_market()
+                last_market_check = now_ts
+                
             tick = feed.get_tick()
             if tick:
                 executor.on_tick(tick)
@@ -91,8 +102,16 @@ async def run_sweep(mode: str = "paper"):
         return
 
     logger.info("扫描模式启动成功，开始极速策略循环...")
+    
+    last_market_check = 0
+    
     try:
         while True:
+            now_ts = int(time.time())
+            if now_ts - last_market_check > 5:
+                feed.discover_market()
+                last_market_check = now_ts
+                
             tick = feed.get_tick()
             if tick:
                 for r in runners:
@@ -130,7 +149,7 @@ def main():
             asyncio.run(run_sweep(mode=args.mode))
         elif args.command == "report":
             gen = ReportGenerator()
-            gen.print_compare() if not args.tags else gen.print_compare(args.tags)
+            gen.print_compare(args.tags or ["T-240", "T-210", "T-180", "T-150", "T-120"])
     except KeyboardInterrupt:
         logger.info("已停止")
 
