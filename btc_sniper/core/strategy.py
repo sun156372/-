@@ -55,8 +55,12 @@ class Strategy:
         self.account = AccountState.fresh()
         self.traded_windows: set = set()
         self.last_trade_ts: float = 0.0
-        self.last_reject_reason: str = ""
-        self.reject_stats: Dict[str, int] = {}
+        
+        # 新增：窗口级拒绝记录逻辑
+        self.current_window_slug: str = ""
+        self.last_reject_reason: str = ""  # 当前窗口的最终拒绝原因
+        self.reject_stats: Dict[str, int] = {}  # 汇总统计
+        
         self._load_state()
 
     @property
@@ -72,13 +76,18 @@ class Strategy:
             acc_data = data.get("account", {})
             if acc_data: self.account = AccountState(**acc_data)
             self.traded_windows = set(data.get("traded_windows", []))
+            self.reject_stats = data.get("reject_stats", {}) # 加载历史统计
             self.account.reset_daily()
         except Exception: pass
 
     def _save_state(self):
         path = self.state_path
         path.parent.mkdir(parents=True, exist_ok=True)
-        data = {"account": asdict(self.account), "traded_windows": list(self.traded_windows)[-500:]}
+        data = {
+            "account": asdict(self.account), 
+            "traded_windows": list(self.traded_windows)[-500:],
+            "reject_stats": self.reject_stats
+        }
         tmp = path.with_name(path.stem + ".tmp")
         tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
         for _ in range(10):
@@ -101,39 +110,47 @@ class Strategy:
         return True, "OK"
 
     def _record_reject(self, reason: str):
-        self.last_reject_reason = reason
-        self.reject_stats[reason] = self.reject_stats.get(reason, 0) + 1
+        # 核心修复：如果已经开单，或者当前窗口已经有拒绝原因，就不再重复记录
+        if self.current_window_slug in self.traded_windows:
+            return
+        if not self.last_reject_reason:
+            self.last_reject_reason = reason
 
     def evaluate(self, tick: Dict[str, Any]) -> Optional[Signal]:
         remain = tick["remain_sec"]
         now_ts = tick["ts"]
-
-        # 条件0：时间窗口
-        if abs(remain - self.entry_remain) > CFG.ENTRY_TOLERANCE_SEC:
-            self._record_reject("未到决策时间点")
-            return None
-
         slug = tick["market_slug"]
-        if CFG.ONLY_ONE_TRADE_PER_WINDOW and slug in self.traded_windows:
-            self._record_reject("本窗口已交易过")
+
+        # === 核心修复1：窗口切换时，归档上一窗口的拒绝原因 ===
+        if slug != self.current_window_slug:
+            if self.last_reject_reason:
+                self.reject_stats[self.last_reject_reason] = self.reject_stats.get(self.last_reject_reason, 0) + 1
+            self.current_window_slug = slug
+            self.last_reject_reason = ""
+
+        # === 核心修复2：入场时间逻辑（T-180 之后均可入场，直到窗口结束前5秒） ===
+        if remain > self.entry_remain:
+            self._record_reject("未到入场时间") # 此时不应该记录，因为根本还没开始评估
+            return None
+        if remain <= CFG.FORCE_CLOSE_REMAIN_SEC:
+            self._record_reject("窗口即将结束")
             return None
 
-        # 条件1：风控
+        if CFG.ONLY_ONE_TRADE_PER_WINDOW and slug in self.traded_windows:
+            return None
+
         allowed, reason = self._check_risk(now_ts)
         if not allowed:
             self._record_reject(reason)
             return None
 
-        # 条件2：价格上限强制小于0.98
         up_ask = tick["up_best_ask"]
         down_ask = tick["down_best_ask"]
         
-        # 核心：强制要求买入价必须 < 0.98
         if up_ask >= 0.98 and down_ask >= 0.98:
             self._record_reject("价格≥0.98")
             return None
 
-        # 点差过滤
         up_spread = tick["up_spread"]
         down_spread = tick["down_spread"]
         if (up_spread and up_spread > CFG.MAX_SPREAD) or (down_spread and down_spread > CFG.MAX_SPREAD):
@@ -144,26 +161,22 @@ class Strategy:
             self._record_reject("盘口深度不足")
             return None
 
-        # 条件3：订单簿名义价值失衡
         imbalance = self._calc_imbalance(tick)
         if abs(imbalance) < CFG.IMBALANCE_THRESHOLD:
             self._record_reject("失衡度不足")
             return None
 
-        # 条件4：代币移动
         up_move = self._token_move(tick, "up")
         down_move = self._token_move(tick, "down")
         if abs(up_move) < CFG.TOKEN_MOVE_THRESHOLD and abs(down_move) < CFG.TOKEN_MOVE_THRESHOLD:
             self._record_reject("代币移动不足")
             return None
 
-        # 条件5：现货移动
         spot_move = self._spot_move(tick)
         if abs(spot_move) < CFG.SPOT_MOVE_THRESHOLD_BPS:
             self._record_reject("现货移动不足")
             return None
 
-        # 方向判断
         direction = self._decide_direction(imbalance, up_move, down_move, spot_move)
         if direction is None:
             self._record_reject("方向不一致")
@@ -172,7 +185,6 @@ class Strategy:
         token_id = tick["up_token_id"] if direction == "UP" else tick["down_token_id"]
         entry_ask = up_ask if direction == "UP" else down_ask
 
-        # 再次确认买入价
         if entry_ask >= 0.98:
             self._record_reject("最终价格≥0.98")
             return None
@@ -185,6 +197,8 @@ class Strategy:
         fee_est = self.calc_taker_fee(shares, entry_ask)
         cost = shares * entry_ask + fee_est
 
+        # 一旦成功开单，清除当前窗口的拒绝原因，避免归档
+        self.last_reject_reason = ""
         return Signal(
             direction=direction, token_id=token_id, entry_ask=entry_ask,
             shares=shares, cost=cost, fee_est=fee_est,
