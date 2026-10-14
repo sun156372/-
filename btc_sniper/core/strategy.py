@@ -37,11 +37,7 @@ class AccountState:
     @staticmethod
     def fresh() -> "AccountState":
         from datetime import date
-        return AccountState(
-            equity=CFG.INIT_EQUITY,
-            peak_equity=CFG.INIT_EQUITY,
-            day=date.today().isoformat(),
-        )
+        return AccountState(equity=CFG.INIT_EQUITY, peak_equity=CFG.INIT_EQUITY, day=date.today().isoformat())
 
     def reset_daily(self):
         from datetime import date
@@ -60,14 +56,12 @@ class Strategy:
         self.traded_windows: set = set()
         self.last_trade_ts: float = 0.0
         self.last_reject_reason: str = ""
-        self.reject_stats: Dict[str, int] = {}  # 统计拒绝原因
+        self.reject_stats: Dict[str, int] = {}
         self._load_state()
 
     @property
     def state_path(self) -> Path:
-        name = CFG.STATE_FILE
-        if self.state_suffix:
-            name = f"state_{self.state_suffix}.json"
+        name = f"state_{self.state_suffix}.json" if self.state_suffix else CFG.STATE_FILE
         return Path(CFG.DATA_DIR) / name
 
     def _load_state(self):
@@ -84,31 +78,26 @@ class Strategy:
     def _save_state(self):
         path = self.state_path
         path.parent.mkdir(parents=True, exist_ok=True)
-        data = {
-            "account": asdict(self.account),
-            "traded_windows": list(self.traded_windows)[-500:],
-        }
+        data = {"account": asdict(self.account), "traded_windows": list(self.traded_windows)[-500:]}
         tmp = path.with_name(path.stem + ".tmp")
         tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
         for _ in range(10):
             try:
-                tmp.replace(path)
-                return
+                tmp.replace(path); return
             except PermissionError: time.sleep(0.1)
         tmp.replace(path)
 
     @staticmethod
     def calc_taker_fee(shares: float, price: float) -> float:
-        gross = CFG.FEE_THETA * shares * price * (1.0 - price)
-        return max(0.0, gross * (1.0 - CFG.TAKER_REBATE_RATE))
+        return max(0.0, CFG.FEE_THETA * shares * price * (1.0 - price) * (1.0 - CFG.TAKER_REBATE_RATE))
 
     def _check_risk(self, now_ts: int) -> Tuple[bool, str]:
         acc = self.account
-        if acc.trades_today >= CFG.MAX_TRADES_PER_DAY: return False, "risk_control_max_trades"
-        if acc.daily_pnl <= -CFG.DAILY_MAX_LOSS_U: return False, "risk_control_daily_loss"
-        if acc.consecutive_losses >= CFG.MAX_CONSECUTIVE_LOSSES: return False, "risk_control_consecutive_loss"
-        if acc.equity < CFG.INIT_EQUITY * 0.05: return False, "risk_control_low_equity"
-        if now_ts - self.last_trade_ts < CFG.COOLDOWN_AFTER_TRADE_SEC: return False, "risk_control_cooldown"
+        if acc.trades_today >= CFG.MAX_TRADES_PER_DAY: return False, "风控:当日笔数超限"
+        if acc.daily_pnl <= -CFG.DAILY_MAX_LOSS_U: return False, "风控:当日亏损超限"
+        if acc.consecutive_losses >= CFG.MAX_CONSECUTIVE_LOSSES: return False, "风控:连亏超限"
+        if acc.equity < CFG.INIT_EQUITY * 0.05: return False, "风控:权益过低"
+        if now_ts - self.last_trade_ts < CFG.COOLDOWN_AFTER_TRADE_SEC: return False, "风控:冷却中"
         return True, "OK"
 
     def _record_reject(self, reason: str):
@@ -119,14 +108,14 @@ class Strategy:
         remain = tick["remain_sec"]
         now_ts = tick["ts"]
 
-        # 条件0：进场时间（容差 ±3s）
+        # 条件0：时间窗口
         if abs(remain - self.entry_remain) > CFG.ENTRY_TOLERANCE_SEC:
-            self._record_reject("time_window_miss")
+            self._record_reject("未到决策时间点")
             return None
 
         slug = tick["market_slug"]
         if CFG.ONLY_ONE_TRADE_PER_WINDOW and slug in self.traded_windows:
-            self._record_reject("already_traded")
+            self._record_reject("本窗口已交易过")
             return None
 
         # 条件1：风控
@@ -135,59 +124,62 @@ class Strategy:
             self._record_reject(reason)
             return None
 
-        # 条件2：盘口基础过滤
+        # 条件2：价格上限强制小于0.98
         up_ask = tick["up_best_ask"]
         down_ask = tick["down_best_ask"]
-        up_valid = CFG.MIN_ENTRY_ASK <= up_ask <= CFG.MAX_ENTRY_ASK
-        down_valid = CFG.MIN_ENTRY_ASK <= down_ask <= CFG.MAX_ENTRY_ASK
-        if not up_valid and not down_valid:
-            self._record_reject("price_out_of_range")
+        
+        # 核心：强制要求买入价必须 < 0.98
+        if up_ask >= 0.98 and down_ask >= 0.98:
+            self._record_reject("价格≥0.98")
             return None
 
+        # 点差过滤
         up_spread = tick["up_spread"]
         down_spread = tick["down_spread"]
         if (up_spread and up_spread > CFG.MAX_SPREAD) or (down_spread and down_spread > CFG.MAX_SPREAD):
-            self._record_reject("spread_too_high")
+            self._record_reject("点差过大")
             return None
 
-        if tick["up_ask_depth"] < CFG.MIN_BID_DEPTH_SHARES:
-            self._record_reject("depth_too_low_up")
-            return None
-        if tick["down_ask_depth"] < CFG.MIN_BID_DEPTH_SHARES:
-            self._record_reject("depth_too_low_down")
+        if tick["up_ask_depth"] < CFG.MIN_BID_DEPTH_SHARES or tick["down_ask_depth"] < CFG.MIN_BID_DEPTH_SHARES:
+            self._record_reject("盘口深度不足")
             return None
 
-        # 条件3：名义价值失衡
+        # 条件3：订单簿名义价值失衡
         imbalance = self._calc_imbalance(tick)
         if abs(imbalance) < CFG.IMBALANCE_THRESHOLD:
-            self._record_reject("imbalance_too_low")
+            self._record_reject("失衡度不足")
             return None
 
         # 条件4：代币移动
         up_move = self._token_move(tick, "up")
         down_move = self._token_move(tick, "down")
         if abs(up_move) < CFG.TOKEN_MOVE_THRESHOLD and abs(down_move) < CFG.TOKEN_MOVE_THRESHOLD:
-            self._record_reject("token_move_too_small")
+            self._record_reject("代币移动不足")
             return None
 
         # 条件5：现货移动
         spot_move = self._spot_move(tick)
         if abs(spot_move) < CFG.SPOT_MOVE_THRESHOLD_BPS:
-            self._record_reject("spot_move_too_small")
+            self._record_reject("现货移动不足")
             return None
 
         # 方向判断
         direction = self._decide_direction(imbalance, up_move, down_move, spot_move)
         if direction is None:
-            self._record_reject("direction_mismatch")
+            self._record_reject("方向不一致")
             return None
 
         token_id = tick["up_token_id"] if direction == "UP" else tick["down_token_id"]
         entry_ask = up_ask if direction == "UP" else down_ask
 
+        # 再次确认买入价
+        if entry_ask >= 0.98:
+            self._record_reject("最终价格≥0.98")
+            return None
+
         shares = self._calc_position_size(entry_ask)
         if shares <= 0:
-            self._record_reject("position_size_zero")
+            self._record_reject("仓位为0")
             return None
 
         fee_est = self.calc_taker_fee(shares, entry_ask)
@@ -206,26 +198,20 @@ class Strategy:
         up_bid_n = tick.get("up_bid_notional", 0.0)
         up_ask_n = tick.get("up_ask_notional", 0.0)
         total = up_bid_n + up_ask_n
-        if total < 1e-9: return 0.0
-        return (up_bid_n - up_ask_n) / total
+        return 0.0 if total < 1e-9 else (up_bid_n - up_ask_n) / total
 
     @staticmethod
     def _token_move(tick, side: str) -> float:
         if side == "up":
-            price = tick.get("up_best_bid") or 0.0
-            open_price = tick.get("up_open_price") or 0.0
+            price, open_price = tick.get("up_best_bid") or 0.0, tick.get("up_open_price") or 0.0
         else:
-            price = tick.get("down_best_bid") or 0.0
-            open_price = tick.get("down_open_price") or 0.0
-        if open_price < 1e-9: return 0.0
-        return price - open_price
+            price, open_price = tick.get("down_best_bid") or 0.0, tick.get("down_open_price") or 0.0
+        return 0.0 if open_price < 1e-9 else price - open_price
 
     @staticmethod
     def _spot_move(tick: Dict[str, Any]) -> float:
-        spot = tick.get("spot_price", 0.0)
-        spot_open = tick.get("spot_open", 0.0)
-        if spot_open < 1e-9: return 0.0
-        return (spot - spot_open) / spot_open * 10000.0
+        spot, spot_open = tick.get("spot_price", 0.0), tick.get("spot_open", 0.0)
+        return 0.0 if spot_open < 1e-9 else (spot - spot_open) / spot_open * 10000.0
 
     @staticmethod
     def _decide_direction(imbalance, up_move, down_move, spot_move) -> Optional[str]:
@@ -237,32 +223,22 @@ class Strategy:
         if spot_move > 0: signals.append("UP")
         elif spot_move < 0: signals.append("DOWN")
         if not signals: return None
-        up_c = signals.count("UP")
-        down_c = signals.count("DOWN")
-        if up_c >= 2: return "UP"
-        if down_c >= 2: return "DOWN"
-        return None
+        up_c, down_c = signals.count("UP"), signals.count("DOWN")
+        return "UP" if up_c >= 2 else "DOWN" if down_c >= 2 else None
 
     @staticmethod
     def _calc_position_size(entry_ask: float) -> float:
         budget = min(CFG.ORDER_BUDGET_U, CFG.INIT_EQUITY * 0.5)
         if entry_ask < 0.01: return 0.0
         shares = budget / entry_ask
-        if shares < CFG.MIN_TRADE_BUDGET_U / entry_ask: return 0.0
-        return round(shares, 2)
+        return 0.0 if shares < CFG.MIN_TRADE_BUDGET_U / entry_ask else round(shares, 2)
 
     def update_account(self, pnl: float, win: bool, market_slug: str):
         acc = self.account
-        acc.total_trades += 1
-        acc.trades_today += 1
-        acc.daily_pnl += pnl
-        acc.total_pnl += pnl
-        if win:
-            acc.wins += 1
-            acc.consecutive_losses = 0
-        else:
-            acc.losses += 1
-            acc.consecutive_losses += 1
+        acc.total_trades += 1; acc.trades_today += 1
+        acc.daily_pnl += pnl; acc.total_pnl += pnl
+        if win: acc.wins += 1; acc.consecutive_losses = 0
+        else: acc.losses += 1; acc.consecutive_losses += 1
         acc.equity += pnl
         acc.peak_equity = max(acc.peak_equity, acc.equity)
         self.traded_windows.add(market_slug)
