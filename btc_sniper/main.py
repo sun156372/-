@@ -20,10 +20,9 @@ def dump_rejects(runners):
     data_dir = Path(CFG.DATA_DIR)
     data_dir.mkdir(parents=True, exist_ok=True)
     for r in runners:
-        # 修复：直接同步 strategy 内部的统计，防止异步写入丢失
-        if r["strategy"].reject_stats:
-            path = data_dir / f"rejects_{r['label']}.json"
-            path.write_text(json.dumps(r["strategy"].reject_stats, ensure_ascii=False, indent=2), encoding="utf-8")
+        path = data_dir / f"rejects_{r['label']}.json"
+        # 核心修复：无条件覆盖写入！即使内存里是空的，也要覆盖掉旧文件
+        path.write_text(json.dumps(r["strategy"].reject_stats, ensure_ascii=False, indent=2), encoding="utf-8")
 
 async def run_single(mode: str = "paper", entry_remain: int = None):
     entry_remain = entry_remain or CFG.DEFAULT_ENTRY_REMAIN
