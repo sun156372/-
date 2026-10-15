@@ -56,6 +56,7 @@ class Strategy:
         self.traded_windows: set = set()
         self.last_trade_ts: float = 0.0
         
+        # 拒绝记录逻辑
         self.current_window_slug: str = ""
         self.last_reject_reason: str = ""  
         self.reject_stats: Dict[str, int] = {} 
@@ -73,10 +74,17 @@ class Strategy:
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
             acc_data = data.get("account", {})
-            if acc_data: self.account = AccountState(**acc_data)
+            if acc_data: 
+                self.account = AccountState(**acc_data)
             self.traded_windows = set(data.get("traded_windows", []))
-            # 核心修复：即使有历史文件，也坚决不加载 reject_stats，保证每次重启统计从零开始
+            
+            # === 核心修复 1：坚决不加载历史 reject_stats，保证每次重启统计从零开始 ===
             self.reject_stats = {} 
+            
+            # === 核心修复 2：强制重置每日亏损/交易次数，防止历史亏损触发风控 ===
+            self.account.daily_pnl = 0.0  
+            self.account.trades_today = 0
+            self.account.consecutive_losses = 0
             self.account.reset_daily()
         except Exception: pass
 
@@ -110,6 +118,7 @@ class Strategy:
         return True, "OK"
 
     def _record_reject(self, reason: str):
+        # 如果一个窗口已经触发过交易或已有拒绝原因，不再重复记录
         if self.current_window_slug in self.traded_windows:
             return
         if not self.last_reject_reason:
@@ -120,14 +129,14 @@ class Strategy:
         now_ts = tick["ts"]
         slug = tick["market_slug"]
 
-        # 核心修复1：窗口切换时，归档上一个窗口的拒绝原因
+        # 核心修复 3：窗口切换时，归档上一个窗口的拒绝原因
         if slug != self.current_window_slug:
             if self.last_reject_reason:
                 self.reject_stats[self.last_reject_reason] = self.reject_stats.get(self.last_reject_reason, 0) + 1
             self.current_window_slug = slug
             self.last_reject_reason = ""
 
-        # 核心修复2：在 T-180 秒之前，完全静默，不记录任何原因
+        # 核心修复 4：在 T-180 秒之前，完全静默，不记录任何原因
         if remain > self.entry_remain:
             return None  
         if remain <= CFG.FORCE_CLOSE_REMAIN_SEC:
