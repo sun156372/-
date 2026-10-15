@@ -62,7 +62,7 @@ async def run_sweep(mode: str = "paper"):
                 if now_ts - last_heartbeat > 5:
                     logger.warning("未获取到 tick 数据，强制记录断流...")
                     feed.discover_market()
-                    for r in runners: r["strategy"].record_feed_error("行情断流") # 核心修复
+                    for r in runners: r["strategy"].record_feed_error("行情断流")
                     feed._rest_fetch_books(); feed._fetch_spot()
                     last_heartbeat = now_ts
                     
