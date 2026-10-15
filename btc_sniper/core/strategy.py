@@ -115,10 +115,12 @@ class Strategy:
         return True, "OK"
 
     def _record_reject(self, reason: str):
-        if self.current_window_slug in self.traded_windows:
-            return
-        if not self.last_reject_reason:
-            self.last_reject_reason = reason
+        if self.current_window_slug in self.traded_windows: return
+        if not self.last_reject_reason: self.last_reject_reason = reason
+
+    def record_feed_error(self, reason: str = "行情断流"):
+        """主程序拿不到 tick 时的强制记账"""
+        self.reject_stats[reason] = self.reject_stats.get(reason, 0) + 1
 
     def update_window(self, new_slug: str):
         """由主程序调用，安全地归档上一个窗口的拒绝原因"""
@@ -132,11 +134,8 @@ class Strategy:
         remain = tick["remain_sec"]
         now_ts = tick["ts"]
 
-        # 在 T-180 秒之前，静默等待
-        if remain > self.entry_remain:
-            return None  
-        if remain <= CFG.FORCE_CLOSE_REMAIN_SEC:
-            return None  
+        if remain > self.entry_remain: return None  
+        if remain <= CFG.FORCE_CLOSE_REMAIN_SEC: return None  
 
         if CFG.ONLY_ONE_TRADE_PER_WINDOW and self.current_window_slug in self.traded_windows:
             return None
@@ -153,8 +152,7 @@ class Strategy:
             self._record_reject("价格≥0.98")
             return None
 
-        up_spread = tick["up_spread"]
-        down_spread = tick["down_spread"]
+        up_spread, down_spread = tick["up_spread"], tick["down_spread"]
         if (up_spread and up_spread > CFG.MAX_SPREAD) or (down_spread and down_spread > CFG.MAX_SPREAD):
             self._record_reject("点差过大")
             return None
@@ -168,8 +166,7 @@ class Strategy:
             self._record_reject("失衡度不足")
             return None
 
-        up_move = self._token_move(tick, "up")
-        down_move = self._token_move(tick, "down")
+        up_move, down_move = self._token_move(tick, "up"), self._token_move(tick, "down")
         if abs(up_move) < CFG.TOKEN_MOVE_THRESHOLD and abs(down_move) < CFG.TOKEN_MOVE_THRESHOLD:
             self._record_reject("代币移动不足")
             return None
@@ -198,55 +195,34 @@ class Strategy:
 
         fee_est = self.calc_taker_fee(shares, entry_ask)
         cost = shares * entry_ask + fee_est
-
         self.last_reject_reason = ""
+        
         return Signal(
             direction=direction, token_id=token_id, entry_ask=entry_ask,
             shares=shares, cost=cost, fee_est=fee_est,
             market_slug=self.current_window_slug, up_token_id=tick["up_token_id"],
             down_token_id=tick["down_token_id"], market_end_ts=tick["market_end_ts"],
-            reason=f"imb={imbalance:.3f} up_mv={up_move:.3f} dn_mv={down_move:.3f} spot={spot_move:.1f}bps",
+            reason=f"imb={imbalance:.3f} spot={spot_move:.1f}bps",
         )
 
     @staticmethod
-    def _calc_imbalance(tick: Dict[str, Any]) -> float:
-        up_bid_n = tick.get("up_bid_notional", 0.0)
-        up_ask_n = tick.get("up_ask_notional", 0.0)
-        total = up_bid_n + up_ask_n
-        return 0.0 if total < 1e-9 else (up_bid_n - up_ask_n) / total
-
+    def _calc_imbalance(tick): return 0.0 if (tick.get("up_bid_notional",0)+tick.get("up_ask_notional",0))<1e-9 else (tick.get("up_bid_notional",0)-tick.get("up_ask_notional",0))/(tick.get("up_bid_notional",0)+tick.get("up_ask_notional",0))
     @staticmethod
-    def _token_move(tick, side: str) -> float:
-        if side == "up":
-            price, open_price = tick.get("up_best_bid") or 0.0, tick.get("up_open_price") or 0.0
-        else:
-            price, open_price = tick.get("down_best_bid") or 0.0, tick.get("down_open_price") or 0.0
-        return 0.0 if open_price < 1e-9 else price - open_price
-
+    def _token_move(tick, side): return (tick.get("up_best_bid") or 0.0) - (tick.get("up_open_price") or 0.0) if side=="up" else (tick.get("down_best_bid") or 0.0) - (tick.get("down_open_price") or 0.0)
     @staticmethod
-    def _spot_move(tick: Dict[str, Any]) -> float:
-        spot, spot_open = tick.get("spot_price", 0.0), tick.get("spot_open", 0.0)
-        return 0.0 if spot_open < 1e-9 else (spot - spot_open) / spot_open * 10000.0
-
+    def _spot_move(tick): return 0.0 if tick.get("spot_open",0)<1e-9 else (tick.get("spot_price",0)-tick.get("spot_open",0))/tick.get("spot_open",0)*10000.0
     @staticmethod
-    def _decide_direction(imbalance, up_move, down_move, spot_move) -> Optional[str]:
-        signals = []
-        if imbalance > 0: signals.append("UP")
-        elif imbalance < 0: signals.append("DOWN")
-        if up_move > 0 and up_move > down_move: signals.append("UP")
-        elif down_move > 0 and down_move > up_move: signals.append("DOWN")
-        if spot_move > 0: signals.append("UP")
-        elif spot_move < 0: signals.append("DOWN")
-        if not signals: return None
-        up_c, down_c = signals.count("UP"), signals.count("DOWN")
-        return "UP" if up_c >= 2 else "DOWN" if down_c >= 2 else None
-
+    def _decide_direction(imb, up_mv, dn_mv, spot):
+        sigs = []
+        if imb > 0: sigs.append("UP")
+        elif imb < 0: sigs.append("DOWN")
+        if up_mv > 0 and up_mv > dn_mv: sigs.append("UP")
+        elif dn_mv > 0 and dn_mv > up_mv: sigs.append("DOWN")
+        if spot > 0: sigs.append("UP")
+        elif spot < 0: sigs.append("DOWN")
+        return "UP" if sigs.count("UP") >= 2 else "DOWN" if sigs.count("DOWN") >= 2 else None
     @staticmethod
-    def _calc_position_size(entry_ask: float) -> float:
-        budget = min(CFG.ORDER_BUDGET_U, CFG.INIT_EQUITY * 0.5)
-        if entry_ask < 0.01: return 0.0
-        shares = budget / entry_ask
-        return 0.0 if shares < CFG.MIN_TRADE_BUDGET_U / entry_ask else round(shares, 2)
+    def _calc_position_size(ask): return round(min(CFG.ORDER_BUDGET_U, CFG.INIT_EQUITY*0.5)/ask, 2) if ask >= 0.01 else 0.0
 
     def update_account(self, pnl: float, win: bool, market_slug: str):
         acc = self.account
