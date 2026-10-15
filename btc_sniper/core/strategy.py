@@ -56,10 +56,10 @@ class Strategy:
         self.traded_windows: set = set()
         self.last_trade_ts: float = 0.0
         
-        # 新增：窗口级拒绝记录逻辑
+        # 窗口级拒绝记录
         self.current_window_slug: str = ""
-        self.last_reject_reason: str = ""  # 当前窗口的最终拒绝原因
-        self.reject_stats: Dict[str, int] = {}  # 汇总统计
+        self.last_reject_reason: str = ""  
+        self.reject_stats: Dict[str, int] = {} 
         
         self._load_state()
 
@@ -76,7 +76,7 @@ class Strategy:
             acc_data = data.get("account", {})
             if acc_data: self.account = AccountState(**acc_data)
             self.traded_windows = set(data.get("traded_windows", []))
-            self.reject_stats = data.get("reject_stats", {}) # 加载历史统计
+            self.reject_stats = data.get("reject_stats", {}) 
             self.account.reset_daily()
         except Exception: pass
 
@@ -110,7 +110,7 @@ class Strategy:
         return True, "OK"
 
     def _record_reject(self, reason: str):
-        # 核心修复：如果已经开单，或者当前窗口已经有拒绝原因，就不再重复记录
+        # 只要还在当前窗口，就只记录第一个失败原因
         if self.current_window_slug in self.traded_windows:
             return
         if not self.last_reject_reason:
@@ -121,20 +121,19 @@ class Strategy:
         now_ts = tick["ts"]
         slug = tick["market_slug"]
 
-        # === 核心修复1：窗口切换时，归档上一窗口的拒绝原因 ===
+        # === 核心修复：窗口切换时，归档上一窗口的拒绝原因 ===
         if slug != self.current_window_slug:
+            # 如果上一窗口有失败原因，记录一次
             if self.last_reject_reason:
                 self.reject_stats[self.last_reject_reason] = self.reject_stats.get(self.last_reject_reason, 0) + 1
             self.current_window_slug = slug
             self.last_reject_reason = ""
 
-        # === 核心修复2：入场时间逻辑（T-180 之后均可入场，直到窗口结束前5秒） ===
+        # === 核心修复：不再记录“未到时间点”的拒绝 ===
         if remain > self.entry_remain:
-            self._record_reject("未到入场时间") # 此时不应该记录，因为根本还没开始评估
-            return None
+            return None  # 直接返回，不记录任何原因
         if remain <= CFG.FORCE_CLOSE_REMAIN_SEC:
-            self._record_reject("窗口即将结束")
-            return None
+            return None  # 直接返回，不记录任何原因
 
         if CFG.ONLY_ONE_TRADE_PER_WINDOW and slug in self.traded_windows:
             return None
@@ -197,7 +196,7 @@ class Strategy:
         fee_est = self.calc_taker_fee(shares, entry_ask)
         cost = shares * entry_ask + fee_est
 
-        # 一旦成功开单，清除当前窗口的拒绝原因，避免归档
+        # 成功开单，清除当前窗口的拒绝原因
         self.last_reject_reason = ""
         return Signal(
             direction=direction, token_id=token_id, entry_ask=entry_ask,
