@@ -56,7 +56,6 @@ class Strategy:
         self.traded_windows: set = set()
         self.last_trade_ts: float = 0.0
         
-        # 拒绝记录逻辑
         self.current_window_slug: str = ""
         self.last_reject_reason: str = ""  
         self.reject_stats: Dict[str, int] = {} 
@@ -78,10 +77,8 @@ class Strategy:
                 self.account = AccountState(**acc_data)
             self.traded_windows = set(data.get("traded_windows", []))
             
-            # === 核心修复 1：坚决不加载历史 reject_stats，保证每次重启统计从零开始 ===
+            # === 核心修复：绝对不加载历史亏损和连亏状态，防止风控锁死 ===
             self.reject_stats = {} 
-            
-            # === 核心修复 2：强制重置每日亏损/交易次数，防止历史亏损触发风控 ===
             self.account.daily_pnl = 0.0  
             self.account.trades_today = 0
             self.account.consecutive_losses = 0
@@ -118,31 +115,30 @@ class Strategy:
         return True, "OK"
 
     def _record_reject(self, reason: str):
-        # 如果一个窗口已经触发过交易或已有拒绝原因，不再重复记录
         if self.current_window_slug in self.traded_windows:
             return
         if not self.last_reject_reason:
             self.last_reject_reason = reason
 
+    def update_window(self, new_slug: str):
+        """由主程序调用，安全地归档上一个窗口的拒绝原因"""
+        if new_slug and new_slug != self.current_window_slug:
+            if self.last_reject_reason:
+                self.reject_stats[self.last_reject_reason] = self.reject_stats.get(self.last_reject_reason, 0) + 1
+            self.current_window_slug = new_slug
+            self.last_reject_reason = ""
+
     def evaluate(self, tick: Dict[str, Any]) -> Optional[Signal]:
         remain = tick["remain_sec"]
         now_ts = tick["ts"]
-        slug = tick["market_slug"]
 
-        # 核心修复 3：窗口切换时，归档上一个窗口的拒绝原因
-        if slug != self.current_window_slug:
-            if self.last_reject_reason:
-                self.reject_stats[self.last_reject_reason] = self.reject_stats.get(self.last_reject_reason, 0) + 1
-            self.current_window_slug = slug
-            self.last_reject_reason = ""
-
-        # 核心修复 4：在 T-180 秒之前，完全静默，不记录任何原因
+        # 在 T-180 秒之前，静默等待
         if remain > self.entry_remain:
             return None  
         if remain <= CFG.FORCE_CLOSE_REMAIN_SEC:
             return None  
 
-        if CFG.ONLY_ONE_TRADE_PER_WINDOW and slug in self.traded_windows:
+        if CFG.ONLY_ONE_TRADE_PER_WINDOW and self.current_window_slug in self.traded_windows:
             return None
 
         allowed, reason = self._check_risk(now_ts)
@@ -207,7 +203,7 @@ class Strategy:
         return Signal(
             direction=direction, token_id=token_id, entry_ask=entry_ask,
             shares=shares, cost=cost, fee_est=fee_est,
-            market_slug=slug, up_token_id=tick["up_token_id"],
+            market_slug=self.current_window_slug, up_token_id=tick["up_token_id"],
             down_token_id=tick["down_token_id"], market_end_ts=tick["market_end_ts"],
             reason=f"imb={imbalance:.3f} up_mv={up_move:.3f} dn_mv={down_move:.3f} spot={spot_move:.1f}bps",
         )
