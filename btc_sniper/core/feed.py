@@ -10,7 +10,6 @@ from typing import Optional, List, Dict, Any, Tuple
 
 from config.config import CFG
 
-# 强制使用 IPv4
 urllib3_cn.allowed_gai_family = lambda: socket.AF_INET
 
 class Level:
@@ -28,11 +27,9 @@ class Book:
 
     @property
     def best_ask(self) -> Optional[float]:
-        # 极致兜底：如果没有卖单，表示卖盘枯竭（价格逼近 1.0）
         return self.asks[0].price if self.asks else 0.99
     @property
     def best_bid(self) -> Optional[float]:
-        # 极致兜底：如果没有买单，表示买盘枯竭（价格逼近 0.01）
         return self.bids[0].price if self.bids else 0.01
     @property
     def spread(self) -> Optional[float]:
@@ -104,8 +101,7 @@ class Feed:
                     self.market_slug = slug
                     self.market_end_ts = end
                     self.token_ids = [up_id, down_id]
-                    now_ts = int(time.time())
-                    elapsed = now_ts - start
+                    elapsed = now - start
                     print(f"[{time.strftime('%H:%M:%S')}] 发现新窗口: {slug} (elapsed={elapsed}s)")
                     self._fetch_spot()
                     self._rest_fetch_books()
@@ -117,8 +113,8 @@ class Feed:
         return False
 
     def _set_open_prices(self):
-        up_book = self.books.get(self.token_ids[0])
-        down_book = self.books.get(self.token_ids[1])
+        up_book = self.books.get(self.token_ids[0]) if len(self.token_ids) > 0 else None
+        down_book = self.books.get(self.token_ids[1]) if len(self.token_ids) > 1 else None
         if up_book and up_book.best_ask: self.up_open_price = up_book.best_ask
         if down_book and down_book.best_ask: self.down_open_price = down_book.best_ask
         if self.spot_price > 0: self.spot_open = self.spot_price
@@ -203,7 +199,6 @@ class Feed:
             for item in msg: self._handle_ws_message(item)
             return
         if not isinstance(msg, dict): return
-
         event_type = msg.get("event_type", "")
         if event_type == "book":
             token_id = msg.get("asset_id")
@@ -262,14 +257,23 @@ class Feed:
 
     def get_tick(self) -> Optional[Dict[str, Any]]:
         if len(self.token_ids) < 2: return None
+        
+        # === 核心修复：窗口过期强制熔断 ===
+        now = int(time.time())
+        if now > self.market_end_ts + 5:
+            print(f"[{time.strftime('%H:%M:%S')}] ⚠️ 窗口已过期！强制重置市场信息，触发下一轮发现...")
+            self.market_slug = ""
+            self.token_ids = []
+            self.books = {}
+            return None
+        # =================================
+
         up_id, down_id = self.token_ids
         up_book = self.books.get(up_id)
         down_book = self.books.get(down_id)
         
-        # 核心修复：只要有 book 对象就返回，不再强制要求买卖一存在
         if not up_book or not down_book: return None
             
-        now = int(time.time())
         return {
             "ts": now, "market_slug": self.market_slug, "market_end_ts": self.market_end_ts,
             "remain_sec": max(0, self.market_end_ts - now),
