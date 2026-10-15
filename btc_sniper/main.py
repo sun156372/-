@@ -21,7 +21,6 @@ def dump_rejects(runners):
     data_dir.mkdir(parents=True, exist_ok=True)
     for r in runners:
         path = data_dir / f"rejects_{r['label']}.json"
-        # 核心修复：无条件覆盖写入！即使内存里是空的，也要覆盖掉旧文件
         path.write_text(json.dumps(r["strategy"].reject_stats, ensure_ascii=False, indent=2), encoding="utf-8")
 
 async def run_single(mode: str = "paper", entry_remain: int = None):
@@ -60,8 +59,10 @@ async def run_single(mode: str = "paper", entry_remain: int = None):
                     logger.info(f"心跳: 剩余={tick['remain_sec']}s | UpAsk={tick['up_best_ask']:.3f} | 失衡={strategy._calc_imbalance(tick):.3f} | 现货={strategy._spot_move(tick):.1f}bps")
                     last_heartbeat = now_ts
             else:
+                # === 核心修复：拿不到数据立刻强制重试，不再默默等待 ===
                 if now_ts - last_heartbeat > 5:
-                    logger.warning("未获取到 tick 数据，检查 feed.books 状态...")
+                    logger.warning("未获取到 tick 数据，强制检查市场并 REST 拉取...")
+                    feed.discover_market() 
                     feed._rest_fetch_books() 
                     feed._fetch_spot()
                     last_heartbeat = now_ts
@@ -117,7 +118,8 @@ async def run_sweep(mode: str = "paper"):
                     last_heartbeat = now_ts
             else:
                 if now_ts - last_heartbeat > 5:
-                    logger.warning("未获取到 tick 数据，检查 feed.books 状态...")
+                    logger.warning("未获取到 tick 数据，强制检查市场并 REST 拉取...")
+                    feed.discover_market()
                     feed._rest_fetch_books()
                     feed._fetch_spot()
                     last_heartbeat = now_ts
