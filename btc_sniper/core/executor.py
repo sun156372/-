@@ -125,3 +125,13 @@ class PaperExecutor(BaseExecutor):
         if spot_open < 1e-9 or spot < 1e-9:
             return "UP" if (tick.get("up_best_bid") or 0.5) >= 0.5 else "DOWN"
         return "UP" if spot >= spot_open else "DOWN"
+
+
+class LiveExecutor(BaseExecutor):
+    """实盘执行器占位，确保 import 成功，实际交易需自行对接私钥"""
+    def _place_entry(self, signal: Signal) -> Tuple[float, float, float]:
+        raise NotImplementedError("实盘交易功能尚未实现，请使用 paper 模式")
+    def _get_exit_bid(self, tick: Dict[str, Any], pos: Position) -> Optional[float]:
+        return None
+    def _get_settlement_result(self, pos: Position, tick: Dict[str, Any]) -> str:
+        return "UP"
