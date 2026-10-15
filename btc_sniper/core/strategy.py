@@ -55,11 +55,9 @@ class Strategy:
         self.account = AccountState.fresh()
         self.traded_windows: set = set()
         self.last_trade_ts: float = 0.0
-        
         self.current_window_slug: str = ""
         self.last_reject_reason: str = ""  
         self.reject_stats: Dict[str, int] = {} 
-        
         self._load_state()
 
     @property
@@ -73,11 +71,8 @@ class Strategy:
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
             acc_data = data.get("account", {})
-            if acc_data: 
-                self.account = AccountState(**acc_data)
+            if acc_data: self.account = AccountState(**acc_data)
             self.traded_windows = set(data.get("traded_windows", []))
-            
-            # === 核心修复：绝对不加载历史亏损和连亏状态，防止风控锁死 ===
             self.reject_stats = {} 
             self.account.daily_pnl = 0.0  
             self.account.trades_today = 0
@@ -119,11 +114,9 @@ class Strategy:
         if not self.last_reject_reason: self.last_reject_reason = reason
 
     def record_feed_error(self, reason: str = "行情断流"):
-        """主程序拿不到 tick 时的强制记账"""
         self.reject_stats[reason] = self.reject_stats.get(reason, 0) + 1
 
     def update_window(self, new_slug: str):
-        """由主程序调用，安全地归档上一个窗口的拒绝原因"""
         if new_slug and new_slug != self.current_window_slug:
             if self.last_reject_reason:
                 self.reject_stats[self.last_reject_reason] = self.reject_stats.get(self.last_reject_reason, 0) + 1
@@ -145,8 +138,7 @@ class Strategy:
             self._record_reject(reason)
             return None
 
-        up_ask = tick["up_best_ask"]
-        down_ask = tick["down_best_ask"]
+        up_ask, down_ask = tick["up_best_ask"], tick["down_best_ask"]
         
         if up_ask >= 0.98 and down_ask >= 0.98:
             self._record_reject("价格≥0.98")
