@@ -9,30 +9,15 @@ from config.config import CFG
 
 @dataclass
 class Signal:
-    direction: str
-    token_id: str
-    entry_ask: float
-    shares: float
-    cost: float
-    fee_est: float
-    market_slug: str
-    up_token_id: str
-    down_token_id: str
-    market_end_ts: int
-    reason: str = ""
+    direction: str; token_id: str; entry_ask: float; shares: float
+    cost: float; fee_est: float; market_slug: str; up_token_id: str
+    down_token_id: str; market_end_ts: int; reason: str = ""
 
 @dataclass
 class AccountState:
-    equity: float
-    peak_equity: float
-    day: str
-    daily_pnl: float = 0.0
-    trades_today: int = 0
-    total_trades: int = 0
-    wins: int = 0
-    losses: int = 0
-    consecutive_losses: int = 0
-    total_pnl: float = 0.0
+    equity: float; peak_equity: float; day: str
+    daily_pnl: float = 0.0; trades_today: int = 0; total_trades: int = 0
+    wins: int = 0; losses: int = 0; consecutive_losses: int = 0; total_pnl: float = 0.0
 
     @staticmethod
     def fresh() -> "AccountState":
@@ -41,15 +26,12 @@ class AccountState:
 
     def reset_daily(self):
         from datetime import date
-        today = date.today().isoformat()
-        if self.day != today:
-            self.day = today
-            self.daily_pnl = 0.0
-            self.trades_today = 0
-            self.consecutive_losses = 0
+        if self.day != date.today().isoformat():
+            self.day = date.today().isoformat()
+            self.daily_pnl = 0.0; self.trades_today = 0; self.consecutive_losses = 0
 
 class Strategy:
-    def __init__(self, entry_remain: int = None, state_suffix: str = ""):
+    def __init__(self, entry_remain: int = None, state_suffix: str = "", custom_params: dict = None):
         self.entry_remain = entry_remain if entry_remain is not None else CFG.DEFAULT_ENTRY_REMAIN
         self.state_suffix = state_suffix
         self.account = AccountState.fresh()
@@ -58,6 +40,17 @@ class Strategy:
         self.current_window_slug: str = ""
         self.last_reject_reason: str = ""  
         self.reject_stats: Dict[str, int] = {} 
+        
+        # === 参数选择器：覆盖默认阈值 ===
+        self.imb_thresh = CFG.IMBALANCE_THRESHOLD
+        self.tok_thresh = CFG.TOKEN_MOVE_THRESHOLD
+        self.spot_thresh = CFG.SPOT_MOVE_THRESHOLD_BPS
+        
+        if custom_params:
+            self.imb_thresh = custom_params.get("imb", self.imb_thresh)
+            self.tok_thresh = custom_params.get("tok", self.tok_thresh)
+            self.spot_thresh = custom_params.get("spot", self.spot_thresh)
+            
         self._load_state()
 
     @property
@@ -83,16 +76,11 @@ class Strategy:
     def _save_state(self):
         path = self.state_path
         path.parent.mkdir(parents=True, exist_ok=True)
-        data = {
-            "account": asdict(self.account), 
-            "traded_windows": list(self.traded_windows)[-500:],
-            "reject_stats": self.reject_stats
-        }
+        data = {"account": asdict(self.account), "traded_windows": list(self.traded_windows)[-500:], "reject_stats": self.reject_stats}
         tmp = path.with_name(path.stem + ".tmp")
         tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
         for _ in range(10):
-            try:
-                tmp.replace(path); return
+            try: tmp.replace(path); return
             except PermissionError: time.sleep(0.1)
         tmp.replace(path)
 
@@ -102,7 +90,7 @@ class Strategy:
 
     def _check_risk(self, now_ts: int) -> Tuple[bool, str]:
         acc = self.account
-        if acc.trades_today >= CFG.MAX_TRADES_PER_DAY: return False, "风控:当日笔数超限"
+        if acc.trades_today >= CFG.MAX_TRADES_PER_DAY: return False, "风控:笔数超限"
         if acc.daily_pnl <= -CFG.DAILY_MAX_LOSS_U: return False, "风控:当日亏损超限"
         if acc.consecutive_losses >= CFG.MAX_CONSECUTIVE_LOSSES: return False, "风控:连亏超限"
         if acc.equity < CFG.INIT_EQUITY * 0.05: return False, "风控:权益过低"
@@ -154,17 +142,17 @@ class Strategy:
             return None
 
         imbalance = self._calc_imbalance(tick)
-        if abs(imbalance) < CFG.IMBALANCE_THRESHOLD:
-            self._record_reject("失衡度不足")
+        if abs(imbalance) < self.imb_thresh:
+            self._record_reject(f"失衡度不足({abs(imbalance):.2f})")
             return None
 
         up_move, down_move = self._token_move(tick, "up"), self._token_move(tick, "down")
-        if abs(up_move) < CFG.TOKEN_MOVE_THRESHOLD and abs(down_move) < CFG.TOKEN_MOVE_THRESHOLD:
+        if abs(up_move) < self.tok_thresh and abs(down_move) < self.tok_thresh:
             self._record_reject("代币移动不足")
             return None
 
         spot_move = self._spot_move(tick)
-        if abs(spot_move) < CFG.SPOT_MOVE_THRESHOLD_BPS:
+        if abs(spot_move) < self.spot_thresh:
             self._record_reject("现货移动不足")
             return None
 
