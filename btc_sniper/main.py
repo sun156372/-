@@ -23,13 +23,16 @@ def dump_rejects(runners):
         path.write_text(json.dumps(r["strategy"].reject_stats, ensure_ascii=False, indent=2), encoding="utf-8")
 
 async def run_sweep(mode: str = "paper"):
-    logger.info(f"启动多时间点扫描 mode={mode}")
+    logger.info(f"启动【参数网格扫描】 mode={mode}")
     runners = []
-    for cfg in CFG.ENTRY_TIMES:
-        strat = Strategy(entry_remain=cfg["remain"], state_suffix=cfg["label"])
-        exec_ = PaperExecutor(strat, tag=cfg["label"]) if mode == "paper" else LiveExecutor(strat, tag=cfg["label"])
-        runners.append({"label": cfg["label"], "strategy": strat, "executor": exec_})
-        logger.info(f"[Sweep] 初始化 {cfg['label']}")
+    
+    # 核心修改：遍历 CFG.PARAM_GRIDS，生成多个不同参数的 Strategy
+    for grid in CFG.PARAM_GRIDS:
+        label = grid["name"]
+        strat = Strategy(entry_remain=180, state_suffix=label, custom_params=grid)
+        exec_ = PaperExecutor(strat, tag=label) if mode == "paper" else LiveExecutor(strat, tag=label)
+        runners.append({"label": label, "strategy": strat, "executor": exec_})
+        logger.info(f"[Sweep] 初始化参数组: {label} (imb={grid['imb']}, tok={grid['tok']}, spot={grid['spot']})")
 
     feed = Feed()
     feed_task = asyncio.create_task(feed.start())
@@ -37,7 +40,7 @@ async def run_sweep(mode: str = "paper"):
         await asyncio.sleep(1)
         logger.info("正在等待市场发现...")
 
-    logger.info("扫描模式启动成功，开始极速策略循环...")
+    logger.info("参数网格启动成功，开始极速策略循环...")
     last_market_check, last_dump, last_heartbeat = 0, 0, 0
     try:
         while True:
@@ -76,7 +79,7 @@ def main():
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="command", required=True)
     p_sweep = sub.add_parser("sweep"); p_sweep.add_argument("--mode", choices=["paper", "live"], default="paper")
-    p_report = sub.add_parser("report"); p_report.add_argument("--tags", nargs="*", default=["T-240", "T-210", "T-180", "T-150", "T-120"])
+    p_report = sub.add_parser("report"); p_report.add_argument("--tags", nargs="*", default=[g["name"] for g in CFG.PARAM_GRIDS])
     args = parser.parse_args()
     if args.command == "sweep":
         asyncio.run(run_sweep(mode=args.mode))
